@@ -151,27 +151,86 @@ timestamps that run backwards, or a meeting with no prior contact are
 data-collection failures, not unusual leads. The tool names the lead and the
 line rather than reporting a number someone would act on.
 
+## SQL version
+
+The same four questions, answered a second time in SQL against `leads` and
+`ad_spend` tables in SQLite instead of in Python against `Lead`/`Spend`
+objects:
+
+```bash
+python sql_report.py data/leads.csv data/ad_spend.csv
+```
+
+This is an independent implementation, not a wrapper around `funnel.py` /
+`channels.py` / `leadtime.py` — `queries.sql` is written from scratch and
+happens to agree with them. `test_sql_report.py` cross-checks every query
+against the Python modules on the same data, and that check caught a real
+bug while it was being written: the first version of `channel_performance`
+returned `NULL` CPL for a channel with leads but no ad spend (organic),
+because the spend side of a `LEFT JOIN` was `NULL` and never coalesced
+before the division — instead of the `0.0` the Python version correctly
+returns. The test failed, the query was fixed, and the fix is why the
+`COALESCE` appears inside the `CASE WHEN` for `cpl`/`cac`/`roas`, not just
+in the plain `spend` column.
+
+The queries cover:
+
+- **`funnel_counts`** / **`conversion_steps`** — stage counts and
+  step-to-step rates via conditional aggregation (`SUM(CASE WHEN ...)`)
+  instead of one query per stage.
+- **`channel_performance`** — spend, CPL, CAC and ROAS per channel, built
+  from a `UNION` of channel names from both tables (so a channel with only
+  spend, or only leads, still gets a row) `LEFT JOIN`ed against both
+  aggregates, with `NULL` preserved wherever a denominator is genuinely
+  zero.
+- **`stage_durations`** — median hours per completed transition. SQLite has
+  no `MEDIAN()`, so it's built from `ROW_NUMBER()` and `COUNT() OVER
+  (PARTITION BY ...)`: rank each duration within its transition, then
+  average whichever row(s) land in the middle — one row for an odd sample,
+  two for an even one.
+- **`sdr_ranking`** — per-SDR close rate with `RANK() OVER`, so two SDRs
+  tied on close rate share a rank and the next one skips a place.
+
+`biggest_leak()` in `sql_report.py` applies the same minimum-sample floor as
+`funnel.biggest_leak()` on top of `conversion_steps` — that floor is a
+business rule about how much data is "enough to call it a leak," not a fact
+about the data, so it stays in Python rather than being baked into the SQL.
+
+`db.py` loads lists of `Lead` / `Spend` into an in-memory SQLite database;
+`sql_report.py` parses `queries.sql` (using the `-- name: x` markers) and
+prints a report shaped like `analyze.py`'s.
+
 ## Tests
 
 ```bash
 python -m pytest -v
 ```
 
-33 tests. The ones worth reading are the ones that encode the decisions above:
-`test_step_rate_and_cumulative_rate_differ`, `test_cpl_and_cac_are_different_questions`,
+41 tests. `test_funnel.py`, `test_channels.py` and `test_leadtime.py` (33)
+cover the Python modules; the ones worth reading are the ones that encode
+the decisions above: `test_step_rate_and_cumulative_rate_differ`,
+`test_cpl_and_cac_are_different_questions`,
 `test_stage_durations_use_only_completed_transitions` and
-`test_close_rate_is_measured_over_leads_received`.
+`test_close_rate_is_measured_over_leads_received`. `test_sql_report.py` (8)
+cross-checks the SQL queries against those same modules, including the
+`NULL`-vs-`0.0` CAC/CPL/ROAS semantics, the even-sample median case, and
+`RANK()` ties.
 
 ## Structure
 
 ```
-funnel.py        Stages, conversion rates, leak detection, validation
-channels.py      Spend, CPL, CAC, ROAS per channel and campaign
-leadtime.py      Stage durations, response time, stalled leads, SDR table
-analyze.py       CLI: reads both CSVs, prints the report
-conftest.py      Test helpers
-make_data.py     Generates the synthetic sample (not part of the tool)
-data/            Sample leads and ad spend
+funnel.py            Stages, conversion rates, leak detection, validation
+channels.py          Spend, CPL, CAC, ROAS per channel and campaign
+leadtime.py          Stage durations, response time, stalled leads, SDR table
+analyze.py           CLI: reads both CSVs, prints the report
+db.py                Loads Lead/Spend lists into an in-memory SQLite database
+queries.sql           SQL: funnel, channel, lead-time and SDR-ranking queries
+sql_report.py        CLI: runs queries.sql, prints the same report via SQL
+conftest.py          Test helpers
+test_sql_report.py   Cross-checks between queries.sql and the Python modules
+make_data.py         Generates the synthetic sample (not part of the tool)
+data/                Sample leads and ad spend
 ```
 
-No dependencies beyond the standard library; `pytest` is only needed for tests.
+No dependencies beyond the standard library (SQLite is built in); `pytest`
+is only needed for tests.
